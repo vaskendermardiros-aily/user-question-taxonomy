@@ -124,10 +124,10 @@ def process_file(input_path: Path, output_path: Path) -> None:
 if __name__ == "__main__":
     raw_data_files = RAW_DATA_DIR.glob("*.jsonl")
 
-    for raw_data_file in raw_data_files:
-        raw_data_file_name = raw_data_file.stem
-        normalized_data_file = NORMALIZED_DATA_DIR / f"{raw_data_file_name}.jsonl"
+    for raw_data_file_path in raw_data_files:
+        raw_data_file_name = raw_data_file_path.stem
+        normalized_data_file_path = NORMALIZED_DATA_DIR / f"{raw_data_file_name}.jsonl"
 
-        _logger.info(f"Processing {raw_data_file}...")
-        process_file(raw_data_file, normalized_data_file)
-        _logger.info(f"Processed {raw_data_file} to {normalized_data_file}")
+        _logger.info(f"Processing {raw_data_file_path}...")
+        process_file(raw_data_file_path, normalized_data_file_path)
+        _logger.info(f"Processed {raw_data_file_path} to {normalized_data_file_path}")
