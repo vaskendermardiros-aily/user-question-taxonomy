@@ -12,12 +12,24 @@ diamond markers and questions use circles instead.
 Solid segments link each question to its answer when `effective_answer` is
 non-empty. Pale dashed segments link consecutive question markers along
 `sequence_number` within each `interaction_id`.
+
+Click a marker to dim everything except that `interaction_id` (path + points);
+click the same marker again to clear. Clicking empty plot area clears when the
+browser sends a click with no picked point.
+
+Hover tooltips list file, ids, timestamps, then Q/A, using only Plotly-supported
+markup (e.g. ``<b>``, ``<br>``); long fields use ``textwrap`` because ``<div>`` etc.
+are not rendered as HTML in Plotly hovers. Translucent hover panels use injected
+CSS (``layout.hoverlabel`` rgba is often ignored by plotly.js for ``hovermode: closest``).
 """
 
 from __future__ import annotations
 
 import argparse
+import html
 import logging
+import textwrap
+from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
@@ -37,6 +49,78 @@ _THIS_DIR = Path(__file__).resolve().parent
 DATA_DIR = _THIS_DIR / "data"
 EMBEDDED_DIR = DATA_DIR / "embedded"
 PLOTS_DIR = DATA_DIR / "plots"
+
+# Plotly hovers only treat a small HTML subset as markup (e.g. <br>, <b>, <i>).
+# Wider tags like <div>/<span> are shown as literal text — use textwrap + <br> only.
+_HOVER_TEXT_WRAP_WIDTH = 42
+# Plotly often ignores alpha in layout.hoverlabel.bgcolor for hovermode "closest" (and
+# 3D); see https://stackoverflow.com/questions/67386595/plotly-hoverlabel-color-transparency
+# Real translucency is applied via scoped CSS in _HOVER_TRANSPARENCY_POST_SCRIPT (fill-opacity
+# on the hover background path). Range ~0.25–0.55; text is forced fully opaque.
+_HOVER_BOX_PATH_FILL_OPACITY = 0.42
+
+def _wrap_hover_plain(text: object, *, wrap_width: int | None = None) -> str:
+    """Plain text -> HTML-safe fragment using only <br> (Plotly-supported in hovers)."""
+    w = _HOVER_TEXT_WRAP_WIDTH if wrap_width is None else wrap_width
+    raw = str(text or "").strip()
+    if not raw:
+        return html.escape("(empty)")
+    lines_out: list[str] = []
+    for para in raw.split("\n"):
+        if not para:
+            lines_out.append("")
+            continue
+        wrapped = textwrap.wrap(
+            para,
+            width=w,
+            break_long_words=True,
+            replace_whitespace=False,
+        )
+        lines_out.extend(wrapped if wrapped else [""])
+    return "<br>".join(html.escape(line) for line in lines_out)
+
+
+def _hover_meta_line(label: str, value: object, *, wrap: bool = False) -> str:
+    """One labeled row; Plotly-safe (<b>, <br> only in markup)."""
+    lab = html.escape(str(label))
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        raw = ""
+    else:
+        raw = str(value).strip()
+    if not raw:
+        body = html.escape("(empty)")
+    elif wrap:
+        body = _wrap_hover_plain(raw)
+    else:
+        body = html.escape(raw)
+    return f"<b>{lab}</b><br>{body}"
+
+
+def _marker_hovertext(sub: pd.DataFrame) -> list[str]:
+    """Hover: metadata + Q/A; only <b>/<br> markup (Plotly hovers)."""
+    out: list[str] = []
+    for _, r in sub.iterrows():
+        meta_parts = [
+            _hover_meta_line("file", r.get("_source_file")),
+            _hover_meta_line("req_user_id", r.get("req_user_id")),
+            _hover_meta_line("interaction_id", r.get("interaction_id"), wrap=True),
+            _hover_meta_line("sequence_number", r.get("sequence_number")),
+        ]
+        if pd.notna(r.get("chat_origin")):
+            meta_parts.append(_hover_meta_line("chat_origin", r.get("chat_origin")))
+        for col, lab in (
+            ("req_created_at", "req_created_at"),
+            ("resp_created_at", "resp_created_at"),
+            ("req_id", "req_id"),
+            ("resp_id", "resp_id"),
+        ):
+            if col in r.index and pd.notna(r.get(col)):
+                meta_parts.append(_hover_meta_line(lab, r.get(col), wrap=True))
+        meta_block = "<br>".join(meta_parts)
+        q = _wrap_hover_plain(r.get("effective_question"))
+        a = _wrap_hover_plain(r.get("effective_answer"))
+        out.append(f"{meta_block}<br><br><b>Q</b><br>{q}<br><br><b>A</b><br>{a}")
+    return out
 
 
 def load_embedded_frames(embedded_dir: Path) -> pd.DataFrame:
@@ -106,26 +190,132 @@ def _umap_neighbors(n_samples: int, requested: int) -> int:
     return max(2, min(requested, n_samples - 1))
 
 
-def _line_segments_open(
-    coords_a: np.ndarray,
-    coords_b: np.ndarray,
-    *,
+def _polyline_coords(
+    segments: list[tuple[np.ndarray, np.ndarray]],
     dims: int,
-) -> tuple[list | None, list | None, list | None]:
-    """Piecewise segments A→B with gaps (None) between pairs."""
+) -> tuple[list, list, list | None]:
+    """Open polyline through segment endpoints with None breaks between segments."""
     xs: list = []
     ys: list = []
     zs: list | None = [] if dims == 3 else None
-    for i in range(len(coords_a)):
+    for ca, cb in segments:
         if dims == 2:
-            xs.extend([coords_a[i, 0], coords_b[i, 0], None])
-            ys.extend([coords_a[i, 1], coords_b[i, 1], None])
+            xs.extend([float(ca[0]), float(cb[0]), None])
+            ys.extend([float(ca[1]), float(cb[1]), None])
         else:
-            xs.extend([coords_a[i, 0], coords_b[i, 0], None])
-            ys.extend([coords_a[i, 1], coords_b[i, 1], None])
+            xs.extend([float(ca[0]), float(cb[0]), None])
+            ys.extend([float(ca[1]), float(cb[1]), None])
             assert zs is not None
-            zs.extend([coords_a[i, 2], coords_b[i, 2], None])
+            zs.extend([float(ca[2]), float(cb[2]), None])
     return xs, ys, zs
+
+
+# Appended after Plotly.newPlot; `{plot_id}` is replaced by write_html before injection.
+_CLICK_HIGHLIGHT_POST_SCRIPT = """
+(function () {
+  var gd = document.getElementById('{plot_id}');
+  if (!gd || !window.Plotly) return;
+
+  var selectedIid = null;
+
+  function iidFromPoint(pt) {
+    if (!pt || pt.customdata === undefined || pt.customdata === null) return null;
+    var v = pt.customdata;
+    if (Array.isArray(v)) v = v[0];
+    return String(v);
+  }
+
+  function isMarkerTrace(tr) {
+    return tr && tr.mode && tr.mode.indexOf('markers') !== -1 && tr.customdata;
+  }
+
+  function applyHighlight(activeIid) {
+    var markerIdx = [];
+    var markerOp = [];
+    var lineIdx = [];
+    var lineOp = [];
+    for (var t = 0; t < gd.data.length; t++) {
+      var tr = gd.data[t];
+      if (isMarkerTrace(tr)) {
+        var n = tr.x.length;
+        var op = new Array(n);
+        for (var i = 0; i < n; i++) {
+          var cid = tr.customdata[i];
+          if (Array.isArray(cid)) cid = cid[0];
+          op[i] = String(cid) === activeIid ? 1.0 : 0.12;
+        }
+        markerIdx.push(t);
+        markerOp.push(op);
+      } else if (tr.meta && tr.meta.interaction_id !== undefined && tr.meta.default_opacity !== undefined) {
+        var match = String(tr.meta.interaction_id) === activeIid;
+        lineIdx.push(t);
+        lineOp.push(match ? tr.meta.default_opacity : 0.06);
+      }
+    }
+    if (markerIdx.length) Plotly.restyle(gd, { 'marker.opacity': markerOp }, markerIdx);
+    if (lineIdx.length) Plotly.restyle(gd, { 'opacity': lineOp }, lineIdx);
+  }
+
+  function resetHighlight() {
+    var markerIdx = [];
+    var markerOp = [];
+    var lineIdx = [];
+    var lineOp = [];
+    for (var t = 0; t < gd.data.length; t++) {
+      var tr = gd.data[t];
+      if (isMarkerTrace(tr)) {
+        var n = tr.x.length;
+        var op = new Array(n);
+        for (var i = 0; i < n; i++) op[i] = 1.0;
+        markerIdx.push(t);
+        markerOp.push(op);
+      } else if (tr.meta && typeof tr.meta.default_opacity === 'number') {
+        lineIdx.push(t);
+        lineOp.push(tr.meta.default_opacity);
+      }
+    }
+    if (markerIdx.length) Plotly.restyle(gd, { 'marker.opacity': markerOp }, markerIdx);
+    if (lineIdx.length) Plotly.restyle(gd, { 'opacity': lineOp }, lineIdx);
+  }
+
+  gd.on('plotly_click', function (ev) {
+    if (!ev.points || !ev.points.length) {
+      selectedIid = null;
+      resetHighlight();
+      return;
+    }
+    var iid = iidFromPoint(ev.points[0]);
+    if (iid === null) {
+      selectedIid = null;
+      resetHighlight();
+      return;
+    }
+    if (selectedIid === iid) {
+      selectedIid = null;
+      resetHighlight();
+      return;
+    }
+    selectedIid = iid;
+    applyHighlight(iid);
+  });
+})();
+"""
+
+# Scoped CSS: layout hoverlabel rgba is often ignored by plotly.js for closest-hover / 3D.
+_HOVER_TRANSPARENCY_POST_SCRIPT = (
+    """
+(function () {
+  var plotId = '{plot_id}';
+  var css =
+    '#' + plotId + ' g.hovertext > path { fill-opacity: __UMAP_FILL_OP__ !important; }\\n' +
+    '#' + plotId + ' g.hovertext text, #' + plotId + ' g.hovertext tspan { opacity: 1 !important; fill-opacity: 1 !important; }';
+  var st = document.createElement('style');
+  st.setAttribute('data-embedded-umap-hover-transparency', '1');
+  st.textContent = css;
+  document.head.appendChild(st);
+})();
+""".replace("__UMAP_FILL_OP__", str(_HOVER_BOX_PATH_FILL_OPACITY))
+)
 
 
 def build_figure(
@@ -185,25 +375,39 @@ def build_figure(
 
     fig = go.Figure()
 
-    # --- Pale dashed paths: consecutive questions within interaction_id ---
-    interaction_segments: list[tuple[np.ndarray, np.ndarray]] = []
-    for _, g in df.groupby("interaction_id", sort=False):
+    path_default_opacity = 0.45
+    qa_default_opacity = 0.85
+
+    # One file per interaction (for legendgroup so lines hide with marker traces).
+    iid_to_source_file = {
+        str(k): str(v) for k, v in df.groupby("interaction_id", sort=False)["_source_file"].first().items()
+    }
+
+    # --- Pale dashed paths: one trace per interaction_id (for hover dimming) ---
+    segments_by_iid: dict[str, list[tuple[np.ndarray, np.ndarray]]] = defaultdict(list)
+    for iid, g in df.groupby("interaction_id", sort=False):
         seq_sort = pd.to_numeric(g["sequence_number"], errors="coerce")
         g2 = g.assign(_seq_sort=seq_sort).sort_values("_seq_sort")
         pairs = g2.index.tolist()
         for i in range(len(pairs) - 1):
             p0, p1 = int(pairs[i]), int(pairs[i + 1])
             if p0 in q_coords and p1 in q_coords:
-                interaction_segments.append((q_coords[p0], q_coords[p1]))
+                segments_by_iid[str(iid)].append((q_coords[p0], q_coords[p1]))
 
-    if interaction_segments:
-        ca = np.stack([s[0] for s in interaction_segments], dtype=float)
-        cb = np.stack([s[1] for s in interaction_segments], dtype=float)
-        lx, ly, lz = _line_segments_open(ca, cb, dims=n_components)
-        line_kw: dict = dict(
-            color="rgba(160, 168, 190, 0.45)",
-            width=1.5,
-            dash="dash",
+    line_kw_path: dict = dict(
+        color="rgba(160, 168, 190, 0.45)",
+        width=1.5,
+        dash="dash",
+    )
+    for iid, segs in segments_by_iid.items():
+        if not segs:
+            continue
+        lx, ly, lz = _polyline_coords(segs, n_components)
+        src_file = iid_to_source_file.get(str(iid), "")
+        meta = dict(
+            trace_type="interaction_path",
+            interaction_id=iid,
+            default_opacity=path_default_opacity,
         )
         if n_components == 2:
             fig.add_trace(
@@ -211,10 +415,13 @@ def build_figure(
                     x=lx,
                     y=ly,
                     mode="lines",
-                    line=line_kw,
+                    line=line_kw_path,
+                    opacity=path_default_opacity,
                     hoverinfo="skip",
                     showlegend=False,
+                    legendgroup=src_file,
                     name="interaction path",
+                    meta=meta,
                 )
             )
         else:
@@ -224,14 +431,17 @@ def build_figure(
                     y=ly,
                     z=lz,
                     mode="lines",
-                    line=line_kw,
+                    line=dict(color="rgba(160, 168, 190, 0.45)", width=1.5, dash="dash"),
+                    opacity=path_default_opacity,
                     hoverinfo="skip",
                     showlegend=False,
+                    legendgroup=src_file,
                     name="interaction path",
+                    meta=meta,
                 )
             )
 
-    # --- Solid question → answer connectors ---
+    # --- Solid question → answer: one trace per row (for hover dimming) ---
     qa_pairs = [
         int(i)
         for i, row in df.iterrows()
@@ -239,55 +449,51 @@ def build_figure(
         and int(i) in q_coords
         and int(i) in a_coords
     ]
-    if qa_pairs:
-        ca = np.stack([q_coords[i] for i in qa_pairs])
-        cb = np.stack([a_coords[i] for i in qa_pairs])
-        lx, ly, lz = _line_segments_open(ca, cb, dims=n_components)
-        line_kw = dict(color="rgba(90, 90, 110, 0.85)", width=2)
+    line_kw_qa = dict(color="rgba(90, 90, 110, 0.85)", width=2)
+    for idx in qa_pairs:
+        row = df.loc[idx]
+        iid = str(row["interaction_id"])
+        src_file = str(row["_source_file"])
+        q_ = q_coords[idx]
+        a_ = a_coords[idx]
+        meta = dict(
+            trace_type="qa_connector",
+            interaction_id=iid,
+            default_opacity=qa_default_opacity,
+        )
         if n_components == 2:
             fig.add_trace(
                 go.Scatter(
-                    x=lx,
-                    y=ly,
+                    x=[float(q_[0]), float(a_[0])],
+                    y=[float(q_[1]), float(a_[1])],
                     mode="lines",
-                    line=line_kw,
+                    line=line_kw_qa,
+                    opacity=qa_default_opacity,
                     hoverinfo="skip",
                     showlegend=False,
+                    legendgroup=src_file,
                     name="Q→A",
+                    meta=meta,
                 )
             )
         else:
             fig.add_trace(
                 go.Scatter3d(
-                    x=lx,
-                    y=ly,
-                    z=lz,
+                    x=[float(q_[0]), float(a_[0])],
+                    y=[float(q_[1]), float(a_[1])],
+                    z=[float(q_[2]), float(a_[2])],
                     mode="lines",
-                    line=line_kw,
+                    line=dict(color="rgba(90, 90, 110, 0.85)", width=2),
+                    opacity=qa_default_opacity,
                     hoverinfo="skip",
                     showlegend=False,
+                    legendgroup=src_file,
                     name="Q→A",
+                    meta=meta,
                 )
             )
 
     Scatter = go.Scatter if n_components == 2 else go.Scatter3d
-
-    def hover_text(kind: str, sub: pd.DataFrame) -> list[str]:
-        lines = []
-        for _, r in sub.iterrows():
-            q_short = str(r.get("effective_question", ""))[:240]
-            a_short = str(r.get("effective_answer", ""))[:240]
-            lines.append(
-                f"<b>{kind}</b><br>"
-                f"file: {r['_source_file']}<br>"
-                f"interaction_id: {r['interaction_id']}<br>"
-                f"sequence_number: {r['sequence_number']}<br>"
-                f"<b>Q</b>: {q_short}<br>"
-                f"<b>A</b>: {a_short}<extra></extra>"
-            )
-        return lines
-
-    colorbar_shown = False
 
     def seq_marker(
         seq_vals: list,
@@ -295,15 +501,13 @@ def build_figure(
         fname: str,
         line_dash: str,
         size: float,
-        show_colorbar: bool,
         marker_symbol: str = "circle",
     ) -> dict:
-        nonlocal colorbar_shown
         line: dict = dict(width=2, color=file_color[fname])
         # Scatter3d marker outlines do not support dash; use symbols to distinguish.
         if n_components == 2:
             line["dash"] = line_dash
-        mk: dict = dict(
+        return dict(
             size=size,
             color=seq_vals,
             colorscale="Viridis",
@@ -311,11 +515,8 @@ def build_figure(
             cmax=cmax,
             symbol=marker_symbol,
             line=line,
+            showscale=False,
         )
-        if show_colorbar and not colorbar_shown:
-            mk["colorbar"] = dict(title="sequence_number")
-            colorbar_shown = True
-        return mk
 
     # Answers first (under questions), then questions on top
     for fname in files:
@@ -331,16 +532,16 @@ def build_figure(
             name=f"{fname} · answers",
             legendgroup=fname,
             showlegend=False,
+            customdata=sub_a["interaction_id"].astype(str).tolist(),
             marker=seq_marker(
                 sub_a["sequence_number"].tolist(),
                 fname=fname,
                 line_dash="dash",
                 size=9,
-                show_colorbar=True,
                 marker_symbol="diamond" if n_components == 3 else "circle",
             ),
-            hovertext=hover_text("answer", sub_a),
-            hovertemplate="%{hovertext}",
+            hovertext=_marker_hovertext(sub_a),
+            hovertemplate="%{hovertext}<extra></extra>",
         )
         if n_components == 2:
             fig.add_trace(Scatter(x=ax[:, 0], y=ax[:, 1], **kwargs))
@@ -355,15 +556,15 @@ def build_figure(
             name=fname,
             legendgroup=fname,
             showlegend=True,
+            customdata=sub_q["interaction_id"].astype(str).tolist(),
             marker=seq_marker(
                 sub_q["sequence_number"].tolist(),
                 fname=fname,
                 line_dash="solid",
                 size=11,
-                show_colorbar=True,
             ),
-            hovertext=hover_text("question", sub_q),
-            hovertemplate="%{hovertext}",
+            hovertext=_marker_hovertext(sub_q),
+            hovertemplate="%{hovertext}<extra></extra>",
         )
         if n_components == 2:
             fig.add_trace(Scatter(x=qx[:, 0], y=qx[:, 1], **kwargs))
@@ -376,6 +577,16 @@ def build_figure(
         title=dict(text="UMAP of question & answer embeddings"),
         legend=dict(groupclick="toggleitem", tracegroupgap=0),
         hovermode="closest",
+        hoverlabel=dict(
+            bgcolor="rgb(255, 255, 255)",
+            bordercolor="rgba(55, 55, 75, 0.38)",
+            align="left",
+            font=dict(
+                size=12,
+                family="system-ui, -apple-system, Segoe UI, sans-serif",
+                color="rgb(24, 24, 34)",
+            ),
+        ),
     )
     if n_components == 2:
         layout_updates["xaxis"] = dict(title="UMAP 1", zeroline=False)
@@ -436,7 +647,12 @@ def main() -> None:
         metric=args.metric,
         random_state=args.random_state,
     )
-    fig.write_html(args.output, include_plotlyjs="cdn")
+    fig.write_html(
+        args.output,
+        include_plotlyjs="cdn",
+        div_id="embedded-umap-plot",
+        post_script=[_CLICK_HIGHLIGHT_POST_SCRIPT, _HOVER_TRANSPARENCY_POST_SCRIPT],
+    )
     _logger.info("Wrote %s", args.output.resolve())
 
 
