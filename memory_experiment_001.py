@@ -33,6 +33,7 @@ _CHAT_ORIGIN_PREFIX: dict[str, str] = {
     "auto_followup": "AF",    # user clicked a suggested follow-up
 }
 
+EMBEDDING_MODEL_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 
 def normalize_text(text: str) -> str:
     if not text or str(text) == "nan":
@@ -102,7 +103,41 @@ def format_user_interactions_df(
     df: pd.DataFrame,
     do_show_answers: bool = True,
 ) -> pd.DataFrame:
+    """Aggregate per-turn rows into one row per interaction.
 
+    Each interaction's turns are sorted by sequence_number and concatenated
+    into a single ``interaction`` string. The prefix for each question is
+    derived from ``chat_origin`` (e.g. ``FQ``, ``FU``).
+
+    Legend — question prefixes:
+    - FQ: free question (user typed, stronger intent signal)
+    - AS: auto-suggestion (user clicked a button, weaker intent signal)
+    - FU: follow-up (user typed, strong intent signal)
+    - AF: auto follow-up (user clicked a button, weaker intent signal)
+    - A:  answer (bot generated)
+
+    Returns a DataFrame with columns:
+        - ``interaction_id``
+        - ``req_user_id``
+        - ``sequence_number`` – max across turns
+        - ``req_created_at``  – min across turns (i.e. when the interaction started)
+        - ``interaction``     – formatted Q/A text
+
+    Example row (``df.iloc[10]``)::
+
+        interaction_id    396a3db2-54ca-487e-a1b6-1a1581d0c6cd
+        req_user_id       0f5dec0d-8688-4581-bc0e-5a63b592cf64
+        sequence_number   0
+        req_created_at    2026-04-21 13:45:04.314726+00:00
+        interaction       FQ: Team performance ABC\nA: Team performa...
+
+    Example ``interaction`` value::
+
+        FQ: Team performance ABC
+        A: Team performance for ABC has shown strong growth ...
+        FU: Can you expand on metric M?
+        A: Metric M is a key performance indicator for the team ...
+    """
     rows: list[dict] = []
     for interaction_id, interaction_df in df.groupby("interaction_id"):
         interaction_df = interaction_df.sort_values(by="sequence_number")
@@ -143,41 +178,46 @@ if __name__ == "__main__":
         user_pipeline(df)
 
 
-# from umap import UMAP
-# from hdbscan import HDBSCAN
-# from sentence_transformers import SentenceTransformer
-# from sklearn.feature_extraction.text import CountVectorizer
+"""  BERTopic
+from umap import UMAP
+from hdbscan import HDBSCAN
+from sentence_transformers import SentenceTransformer
+from sklearn.feature_extraction.text import CountVectorizer
 
-# from bertopic import BERTopic
-# from bertopic.representation import KeyBERTInspired
-# from bertopic.vectorizers import ClassTfidfTransformer
+from bertopic import BERTopic
+from bertopic.representation import KeyBERTInspired
+from bertopic.vectorizers import ClassTfidfTransformer
 
 
-# # Step 1 - Extract embeddings
-# embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
+# Step 1 - Extract embeddings
+# embedding_model = SentenceTransformer("all-MiniLM-L6-v2")  # example
+# NOTE: our data is multilingual, so we use the multilingual model
+EMBEDDING_MODEL_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
 
-# # Step 2 - Reduce dimensionality
-# umap_model = UMAP(n_neighbors=15, n_components=5, min_dist=0.0, metric='cosine')
+# Step 2 - Reduce dimensionality
+umap_model = UMAP(n_neighbors=15, n_components=5, min_dist=0.0, metric='cosine')
 
-# # Step 3 - Cluster reduced embeddings
-# hdbscan_model = HDBSCAN(min_cluster_size=15, metric='euclidean', cluster_selection_method='eom', prediction_data=True)
+# Step 3 - Cluster reduced embeddings
+hdbscan_model = HDBSCAN(min_cluster_size=15, metric='euclidean', cluster_selection_method='eom', prediction_data=True)
 
-# # Step 4 - Tokenize topics
-# vectorizer_model = CountVectorizer(stop_words="english")
+# Step 4 - Tokenize topics
+vectorizer_model = CountVectorizer(stop_words="english")
 
-# # Step 5 - Create topic representation
-# ctfidf_model = ClassTfidfTransformer()
+# Step 5 - Create topic representation
+ctfidf_model = ClassTfidfTransformer()
 
-# # Step 6 - (Optional) Fine-tune topic representations with
-# # a `bertopic.representation` model
-# representation_model = KeyBERTInspired()
+# Step 6 - (Optional) Fine-tune topic representations with
+# a `bertopic.representation` model
+representation_model = KeyBERTInspired()
 
-# # All steps together
-# topic_model = BERTopic(
-#   embedding_model=embedding_model,          # Step 1 - Extract embeddings
-#   umap_model=umap_model,                    # Step 2 - Reduce dimensionality
-#   hdbscan_model=hdbscan_model,              # Step 3 - Cluster reduced embeddings
-#   vectorizer_model=vectorizer_model,        # Step 4 - Tokenize topics
-#   ctfidf_model=ctfidf_model,                # Step 5 - Extract topic words
-#   representation_model=representation_model # Step 6 - (Optional) Fine-tune topic representations
-# )
+# All steps together
+topic_model = BERTopic(
+  embedding_model=embedding_model,          # Step 1 - Extract embeddings
+  umap_model=umap_model,                    # Step 2 - Reduce dimensionality
+  hdbscan_model=hdbscan_model,              # Step 3 - Cluster reduced embeddings
+  vectorizer_model=vectorizer_model,        # Step 4 - Tokenize topics
+  ctfidf_model=ctfidf_model,                # Step 5 - Extract topic words
+  representation_model=representation_model # Step 6 - (Optional) Fine-tune topic representations
+)
+"""
