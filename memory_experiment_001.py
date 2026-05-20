@@ -1,3 +1,4 @@
+import html
 import json
 import re
 import textwrap
@@ -53,6 +54,9 @@ EMBEDDING_MODEL_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12
 USER_AXIS_RANGES: dict[str, dict] = {
     # "0f5dec0d-8688-4581-bc0e-5a63b592cf64": {"x_range": (-5, 12), "y_range": (-8, 6)},
 }
+# Plotly hovers only treat a small HTML subset as markup (e.g. <br>, <b>, <i>).
+_HOVER_TEXT_WRAP_WIDTH = 42
+_INTERACTION_PREVIEW_MAX_CHARS = 400
 
 
 # ---------------------------------------------------------------------------
@@ -276,6 +280,76 @@ def compute_2d_umap(
     return coords[:, 0].tolist(), coords[:, 1].tolist()
 
 
+def _wrap_hover_plain(text: object, *, wrap_width: int | None = None) -> str:
+    """Plain text -> HTML-safe fragment using only <br> (Plotly-supported in hovers)."""
+    w = _HOVER_TEXT_WRAP_WIDTH if wrap_width is None else wrap_width
+    raw = str(text or "").strip()
+    if not raw:
+        return html.escape("(empty)")
+    lines_out: list[str] = []
+    for para in raw.split("\n"):
+        if not para:
+            lines_out.append("")
+            continue
+        wrapped = textwrap.wrap(
+            para,
+            width=w,
+            break_long_words=True,
+            replace_whitespace=False,
+        )
+        lines_out.extend(wrapped if wrapped else [""])
+    return "<br>".join(html.escape(line) for line in lines_out)
+
+
+def _hover_meta_line(label: str, value: object, *, wrap: bool = False) -> str:
+    lab = html.escape(str(label))
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        raw = ""
+    else:
+        raw = str(value).strip()
+    if not raw:
+        body = html.escape("(empty)")
+    elif wrap:
+        body = _wrap_hover_plain(raw)
+    else:
+        body = html.escape(raw)
+    return f"<b>{lab}</b><br>{body}"
+
+
+def _topic_label_sort_key(label: object) -> tuple[int, str]:
+    """Numeric order for labels like ``-1_outliers``, ``0_foo``, ``10_bar``."""
+    s = str(label)
+    m = re.match(r"^(-?\d+)_", s)
+    if m:
+        return (int(m.group(1)), s)
+    return (999_999, s)
+
+
+def _interaction_preview(text: object, *, max_chars: int = _INTERACTION_PREVIEW_MAX_CHARS) -> str:
+    raw = str(text or "").strip()
+    if len(raw) > max_chars:
+        raw = raw[: max_chars - 1] + "…"
+    return raw
+
+
+def _umap_marker_hovertext(sub: pd.DataFrame) -> list[str]:
+    out: list[str] = []
+    for _, r in sub.iterrows():
+        date = r["req_created_at"]
+        if hasattr(date, "strftime"):
+            date = date.strftime("%Y-%m-%d")
+        meta = "<br>".join(
+            [
+                _hover_meta_line("Topic", r.get("topic_label")),
+                _hover_meta_line("date", date),
+                _hover_meta_line("interaction_id", r.get("interaction_id"), wrap=True),
+            ]
+        )
+        preview = _wrap_hover_plain(_interaction_preview(r.get("interaction")))
+        out.append(f"{meta}<br><br><b>interaction_preview</b><br>{preview}")
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Per-user UMAP plot
 # ---------------------------------------------------------------------------
@@ -308,13 +382,8 @@ def plot_user_umap(
         _logger.warning(f"No interactions for user {user_id}, skipping plot")
         return
 
-    user_df["interaction_preview"] = user_df["interaction"].apply(
-        lambda t: textwrap.shorten(t, width=200, placeholder="…")
-    )
-    user_df["date"] = user_df["req_created_at"].dt.strftime("%Y-%m-%d")
-
     # Assign grey to outlier topic -1, distinct colours for real topics
-    all_topics = sorted(user_df["topic_label"].unique())
+    all_topics = sorted(user_df["topic_label"].unique(), key=_topic_label_sort_key)
     outlier_label = next((lbl for lbl in all_topics if lbl.startswith("-1_")), None)
     non_outlier = [lbl for lbl in all_topics if lbl != outlier_label]
     color_sequence = px.colors.qualitative.Plotly
@@ -328,21 +397,24 @@ def plot_user_umap(
         y="umap_y",
         color="topic_label",
         color_discrete_map=color_map,
-        hover_data={
-            "topic_label": True,
-            "date": True,
-            "interaction_preview": True,
-            "umap_x": False,
-            "umap_y": False,
-        },
+        category_orders={"topic_label": all_topics},
         title=f"UMAP 2D — {user_id}",
         labels={"topic_label": "Topic", "umap_x": "UMAP-1", "umap_y": "UMAP-2"},
     )
+    for trace in fig.data:
+        sub = user_df[user_df["topic_label"] == trace.name]
+        trace.hovertext = _umap_marker_hovertext(sub)
+        trace.hovertemplate = "%{hovertext}<extra></extra>"
     fig.update_traces(marker=dict(size=8, opacity=0.85))
     fig.update_layout(
         legend_title_text="Topic",
         width=900,
         height=650,
+        hovermode="closest",
+        hoverlabel=dict(
+            align="left",
+            font=dict(size=12),
+        ),
     )
     if x_range is not None:
         fig.update_xaxes(range=list(x_range))
