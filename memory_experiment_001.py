@@ -57,6 +57,22 @@ USER_AXIS_RANGES: dict[str, dict] = {
 # Plotly hovers only treat a small HTML subset as markup (e.g. <br>, <b>, <i>).
 _HOVER_TEXT_WRAP_WIDTH = 42
 _INTERACTION_PREVIEW_MAX_CHARS = 400
+# layout.hoverlabel rgba is often ignored for hovermode "closest"; use CSS fill-opacity instead.
+_HOVER_BOX_PATH_FILL_OPACITY = 0.80
+_HOVER_TRANSPARENCY_POST_SCRIPT = (
+    """
+(function () {
+  var plotId = '{plot_id}';
+  var css =
+    '#' + plotId + ' g.hovertext > path { fill-opacity: __UMAP_FILL_OP__ !important; }\\n' +
+    '#' + plotId + ' g.hovertext text, #' + plotId + ' g.hovertext tspan { opacity: 1 !important; fill-opacity: 1 !important; }';
+  var st = document.createElement('style');
+  st.setAttribute('data-memory-umap-hover-transparency', '1');
+  st.textContent = css;
+  document.head.appendChild(st);
+})();
+""".replace("__UMAP_FILL_OP__", str(_HOVER_BOX_PATH_FILL_OPACITY))
+)
 
 
 # ---------------------------------------------------------------------------
@@ -405,6 +421,10 @@ def plot_user_umap(
         sub = user_df[user_df["topic_label"] == trace.name]
         trace.hovertext = _umap_marker_hovertext(sub)
         trace.hovertemplate = "%{hovertext}<extra></extra>"
+        marker_color = trace.marker.color
+        if isinstance(marker_color, str):
+            # Per-trace color; layout.hoverlabel.bgcolor would override all traces with white.
+            trace.hoverlabel = dict(bgcolor=marker_color, bordercolor=marker_color)
     fig.update_traces(marker=dict(size=8, opacity=0.85))
     fig.update_layout(
         legend_title_text="Topic",
@@ -413,7 +433,7 @@ def plot_user_umap(
         hovermode="closest",
         hoverlabel=dict(
             align="left",
-            font=dict(size=12),
+            font=dict(size=12, color="white"),
         ),
     )
     if x_range is not None:
@@ -422,7 +442,12 @@ def plot_user_umap(
         fig.update_yaxes(range=list(y_range))
 
     output_path = output_dir / f"umap_{user_id}.html"
-    fig.write_html(str(output_path), include_plotlyjs="cdn")
+    fig.write_html(
+        str(output_path),
+        include_plotlyjs="cdn",
+        div_id=f"umap-plot-{user_id}",
+        post_script=[_HOVER_TRANSPARENCY_POST_SCRIPT],
+    )
     _logger.info(f"Saved UMAP plot → {output_path}")
 
 
